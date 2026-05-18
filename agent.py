@@ -308,6 +308,10 @@ def upload_pdf_for_whatsapp(content_bytes, filename):
 
 def send_whatsapp(message, media_url=None):
     try:
+        # Twilio WhatsApp has a strict 1600 character limit.
+        if len(message) > 1500:
+            message = message[:1500] + "\n\n...[Message Truncated due to length limit]"
+
         client = Client(TWILIO_SID, TWILIO_TOKEN)
         kwargs = dict(body=message, from_=FROM_WHATSAPP, to=TO_WHATSAPP)
         if media_url:
