@@ -18,6 +18,8 @@ if hasattr(sys.stdout, 'reconfigure'):
 
 load_dotenv()
 
+print("hello world") # Added for demonstration purposes
+
 # ========== CREDENTIALS FROM .env ==========
 TENANT_ID     = os.environ.get("TENANT_ID")
 CLIENT_ID     = os.environ.get("CLIENT_ID")
@@ -32,6 +34,21 @@ TO_WHATSAPP   = os.environ.get("TO_WHATSAPP")
 
 seen_ids = set()
 
+# ──────────────────────────────────────────────
+#  IGNORED SENDERS (Spam / Newsletters)
+# ──────────────────────────────────────────────
+IGNORED_SENDERS = {
+    "noreply@mail.iaapa.org",
+    "info@e.atlassian.com",
+    "taylor.griggs@glean.com",
+    "evelinawahlstrom@sanity.io",
+    "no-reply@razorpay.com",
+    "team@mail.clickup.com",
+    "hello@news.railway.app",
+    "invoice+statements@vercel.com",
+    "support@msg91.com",
+    "fred@fireflies.ai"
+}
 
 # ──────────────────────────────────────────────
 #  HELPERS
@@ -372,6 +389,12 @@ def run():
 
                 sender_email    = em["from"]["emailAddress"]["address"]
                 sender_name     = em["from"]["emailAddress"].get("name", sender_email.split("@")[0])
+
+                if sender_email.lower() in IGNORED_SENDERS:
+                    print(f"[IGNORED] Skipping email from {sender_email}")
+                    mark_as_read(token, email_id)
+                    continue
+
                 subject         = em.get("subject", "No Subject")
                 body            = em.get("bodyPreview", "")
                 full_body       = em.get("body", {}).get("content", body)
