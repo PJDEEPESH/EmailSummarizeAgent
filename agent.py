@@ -39,6 +39,7 @@ seen_ids = set()
 # ──────────────────────────────────────────────
 IGNORED_SENDERS = {
     "noreply@mail.iaapa.org",
+    "dailynewsletter@iaapa.org",
     "info@e.atlassian.com",
     "taylor.griggs@glean.com",
     "evelinawahlstrom@sanity.io",
