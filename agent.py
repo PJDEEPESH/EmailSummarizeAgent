@@ -115,7 +115,7 @@ def get_access_token():
         "client_secret": CLIENT_SECRET,
         "scope":         "https://graph.microsoft.com/.default"
     }
-    resp = requests.post(url, data=data, timeout=15)
+    resp = requests.post(url, data=data, timeout=30)
     result = resp.json()
     if "access_token" not in result:
         error_desc = result.get("error_description", str(result))
@@ -132,7 +132,7 @@ def get_new_emails(token, start_time):
         "$top":     10,
         "$select":  "id,subject,from,bodyPreview,body,hasAttachments"
     }
-    resp = requests.get(url, headers=headers, params=params, timeout=15)
+    resp = requests.get(url, headers=headers, params=params, timeout=30)
     return resp.json().get("value", [])
 
 
@@ -140,7 +140,7 @@ def get_attachments_content(token, email_id):
     """Returns list of (name, text, raw_bytes)."""
     url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_TO_WATCH}/messages/{email_id}/attachments"
     headers = {"Authorization": f"Bearer {token}"}
-    resp = requests.get(url, headers=headers, timeout=20)
+    resp = requests.get(url, headers=headers, timeout=60)
     attachments = resp.json().get("value", [])
 
     results = []
@@ -225,7 +225,7 @@ Body: {body}
 {att_context}
 {link_context}"""
 
-    resp = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=30)
+    resp = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=60)
     result = resp.json()
 
     # ── Error handling for Gemini ──
@@ -360,7 +360,7 @@ def send_whatsapp(message, media_url=None):
 def mark_as_read(token, email_id):
     url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_TO_WATCH}/messages/{email_id}"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    requests.patch(url, headers=headers, json={"isRead": True}, timeout=10)
+    requests.patch(url, headers=headers, json={"isRead": True}, timeout=30)
 
 
 # ──────────────────────────────────────────────
@@ -450,11 +450,18 @@ def run():
             if consecutive_errors == 1:  # alert only first time, not every 30s
                 send_alert("Azure Auth Failed", f"{err}\nCheck TENANT_ID, CLIENT_ID, CLIENT_SECRET in .env")
 
-        except requests.exceptions.ConnectionError:
-            print("[ERROR] No internet connection.")
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            err_type = type(e).__name__
+            print(f"[NETWORK] Transient: {err_type} - will retry in 30s")
             consecutive_errors += 1
-            if consecutive_errors == 3:
-                send_alert("No Internet", "The email agent lost internet connection for 3 checks in a row.")
+            if consecutive_errors == 5:
+                send_alert(
+                    "Network Issues Persisting",
+                    f"Agent has had {consecutive_errors} consecutive network failures.\n"
+                    f"Latest: {err_type}\n"
+                    f"This is usually transient (Graph or Gemini slowness).\n"
+                    f"No action needed unless it persists for 30+ minutes."
+                )
 
         except Exception as e:
             print(f"[ERROR] Unexpected: {e}")
