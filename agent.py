@@ -5,6 +5,7 @@ import base64
 import io
 import requests
 import time
+import functools
 from twilio.rest import Client
 from twilio.base.exceptions import TwilioRestException
 from datetime import datetime, timezone
@@ -50,6 +51,32 @@ IGNORED_SENDERS = {
     "support@msg91.com",
     "fred@fireflies.ai"
 }
+
+# ──────────────────────────────────────────────
+#  RETRY DECORATOR (transient network errors)
+# ──────────────────────────────────────────────
+
+def retry_network(max_attempts=3, initial_delay=2):
+    """Retry the wrapped function on Timeout/ConnectionError with exponential backoff.
+    Final failure re-raises so the outer handler can count it."""
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            delay = initial_delay
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return func(*args, **kwargs)
+                except (requests.exceptions.Timeout,
+                        requests.exceptions.ConnectionError) as e:
+                    if attempt == max_attempts:
+                        raise
+                    print(f"[RETRY] {func.__name__} ({type(e).__name__}), "
+                          f"attempt {attempt}/{max_attempts}, waiting {delay}s")
+                    time.sleep(delay)
+                    delay *= 2
+        return wrapper
+    return decorator
+
 
 # ──────────────────────────────────────────────
 #  HELPERS
@@ -107,6 +134,7 @@ def send_alert(title, detail):
 #  MICROSOFT GRAPH
 # ──────────────────────────────────────────────
 
+@retry_network()
 def get_access_token():
     url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
     data = {
@@ -123,6 +151,7 @@ def get_access_token():
     return result["access_token"]
 
 
+@retry_network()
 def get_new_emails(token, start_time):
     url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_TO_WATCH}/mailFolders/inbox/messages"
     headers = {"Authorization": f"Bearer {token}"}
@@ -136,6 +165,7 @@ def get_new_emails(token, start_time):
     return resp.json().get("value", [])
 
 
+@retry_network()
 def get_attachments_content(token, email_id):
     """Returns list of (name, text, raw_bytes)."""
     url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_TO_WATCH}/messages/{email_id}/attachments"
@@ -174,6 +204,7 @@ def get_attachments_content(token, email_id):
 #  GEMINI SUMMARIZE
 # ──────────────────────────────────────────────
 
+@retry_network()
 def summarize_with_gemini(sender_name, sender_email, subject, body,
                           attachment_data, links, greeting):
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -351,12 +382,14 @@ def send_whatsapp(message, media_url=None):
             send_alert("Twilio Invalid Number", f"TO_WHATSAPP number may be wrong.\nError: {msg[:200]}")
         else:
             send_alert("Twilio Send Failed", msg[:300])
+        raise  # let caller know send failed so email isn't marked-as-read
 
 
 # ──────────────────────────────────────────────
 #  MARK AS READ
 # ──────────────────────────────────────────────
 
+@retry_network()
 def mark_as_read(token, email_id):
     url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_TO_WATCH}/messages/{email_id}"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -386,14 +419,17 @@ def run():
                 email_id = em["id"]
                 if email_id in seen_ids:
                     continue
-                seen_ids.add(email_id)
 
                 sender_email    = em["from"]["emailAddress"]["address"]
                 sender_name     = em["from"]["emailAddress"].get("name", sender_email.split("@")[0])
 
                 if sender_email.lower() in IGNORED_SENDERS:
                     print(f"[IGNORED] Skipping email from {sender_email}")
-                    mark_as_read(token, email_id)
+                    try:
+                        mark_as_read(token, email_id)
+                        seen_ids.add(email_id)
+                    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                        pass  # transient — leave email unread, retry next iteration
                     continue
 
                 subject         = em.get("subject", "No Subject")
@@ -408,17 +444,26 @@ def run():
                 if links:
                     print(f"[LINKS] {len(links)} found")
 
-                attachment_data = []
-                if has_attachments:
-                    attachment_data = get_attachments_content(token, email_id)
+                try:
+                    attachment_data = []
+                    if has_attachments:
+                        attachment_data = get_attachments_content(token, email_id)
 
-                greeting = get_greeting()
-                summary  = summarize_with_gemini(
-                    sender_name, sender_email, subject, body,
-                    attachment_data, links, greeting
-                )
+                    greeting = get_greeting()
+                    summary  = summarize_with_gemini(
+                        sender_name, sender_email, subject, body,
+                        attachment_data, links, greeting
+                    )
 
-                if summary:
+                    if summary is None:
+                        # Permanent Gemini failure (already alerted via send_alert).
+                        # Mark seen so we don't burn tokens this session, but DON'T
+                        # mark-as-read on Graph so a process restart can redeliver
+                        # once the underlying issue (quota, key, etc.) is fixed.
+                        print(f"[SKIP] Gemini failed for {email_id} - will retry on process restart")
+                        seen_ids.add(email_id)
+                        continue
+
                     print(f"[SUMMARY]\n{summary}")
 
                     # Collect PDF public URLs
@@ -437,10 +482,18 @@ def run():
                             send_whatsapp("(Additional attachment)", media_url=extra)
                     else:
                         send_whatsapp(summary)
-                else:
-                    print("[WARN] No summary returned.")
 
-                mark_as_read(token, email_id)
+                    # Full success — mark-as-read on Graph AND record locally
+                    mark_as_read(token, email_id)
+                    seen_ids.add(email_id)
+
+                except TwilioRestException:
+                    # WhatsApp delivery failed (already alerted in send_whatsapp).
+                    # Mark seen this session to avoid re-summarizing, but DON'T
+                    # mark-as-read on Graph so a restart can redeliver once Twilio
+                    # is back (e.g. after topping up balance).
+                    print(f"[SKIP] WhatsApp failed for {email_id} - will retry on process restart")
+                    seen_ids.add(email_id)
 
         except RuntimeError as e:
             # Azure auth failure
